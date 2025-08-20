@@ -1,0 +1,153 @@
+import glob
+import re
+import os
+
+# Settings
+READS_DIR = "/home/galanova/projects/kulakova_deti/metagenome_may2025"
+SAMPLES = sorted(
+    d.replace("-metagenome", "")
+    for d in os.listdir("/home/galanova/projects/kulakova_deti/metagenome_may2025")
+    if d.endswith("-metagenome")
+)
+GENOME_INDEX = "/home/galanova/human_genome/GRCh38_index"
+THREADS = 32
+FASTQC_DIR = "fastqc"
+
+
+
+
+def get_r1(wildcards):
+    pattern = f"{READS_DIR}/{wildcards.sample}-metagenome/raw_data_{wildcards.sample}/*_1.fq.gz"
+    matches = glob.glob(pattern)
+    if not matches:
+        raise ValueError(f"R1 file not found for sample: {wildcards.sample}\nTried: {pattern}")
+    return matches[0]
+
+def get_r2(wildcards):
+    pattern = f"{READS_DIR}/{wildcards.sample}-metagenome/raw_data_{wildcards.sample}/*_2.fq.gz"
+    matches = glob.glob(pattern)
+    if not matches:
+        raise ValueError(f"R2 file not found for sample: {wildcards.sample}\nTried: {pattern}")
+    return matches[0]
+
+rule all:
+    input:
+        expand(f"{FASTQC_DIR}/raw/{{sample}}/.done", sample=SAMPLES),
+        expand(f"{FASTQC_DIR}/trimmed/{{sample}}/.done", sample=SAMPLES),
+        expand(f"{FASTQC_DIR}/filtered/{{sample}}/.done", sample=SAMPLES),
+
+        expand("trimmed_reads/{sample}_R1_paired.fastq.gz",   sample=SAMPLES),
+        expand("trimmed_reads/{sample}_R1_unpaired.fastq.gz", sample=SAMPLES),
+        expand("trimmed_reads/{sample}_R2_paired.fastq.gz",   sample=SAMPLES),
+        expand("trimmed_reads/{sample}_R2_unpaired.fastq.gz", sample=SAMPLES),
+
+        expand("filtered_reads/{sample}_R1_unmapped.fq.gz", sample=SAMPLES),
+        expand("filtered_reads/{sample}_R2_unmapped.fq.gz", sample=SAMPLES)
+
+
+rule fastqc_raw:
+    input:
+        r1=get_r1,
+        r2=get_r2
+    output:
+        done=touch(f"{FASTQC_DIR}/raw/{{sample}}/.done")
+    threads: THREADS
+    shell:
+        r"""
+        mkdir -p {FASTQC_DIR}/raw/{wildcards.sample}
+        fastqc -t {threads} -o {FASTQC_DIR}/raw/{wildcards.sample} {input.r1} {input.r2}
+        touch {output.done}
+        """
+
+rule fastqc_trimmed:
+    input:
+        r1="trimmed_reads/{sample}_R1_paired.fastq.gz",
+        r2="trimmed_reads/{sample}_R2_paired.fastq.gz"
+    output:
+        done=touch(f"{FASTQC_DIR}/trimmed/{{sample}}/.done")
+    threads: THREADS
+    shell:
+        r"""
+        mkdir -p {FASTQC_DIR}/trimmed/{wildcards.sample}
+        fastqc -t {threads} -o {FASTQC_DIR}/trimmed/{wildcards.sample} {input.r1} {input.r2}
+        touch {output.done}
+        """
+
+rule fastqc_filtered:
+    input:
+        r1="filtered_reads/{sample}_R1_unmapped.fq.gz",
+        r2="filtered_reads/{sample}_R2_unmapped.fq.gz"
+    output:
+        done=touch(f"{FASTQC_DIR}/filtered/{{sample}}/.done")
+    threads: THREADS
+    shell:
+        r"""
+        mkdir -p {FASTQC_DIR}/filtered/{wildcards.sample}
+        fastqc -t {threads} -o {FASTQC_DIR}/filtered/{wildcards.sample} {input.r1} {input.r2}
+        touch {output.done}
+        """
+
+rule trim_reads:
+    input:
+        r1=get_r1,
+        r2=get_r2
+    output:
+        r1_paired="trimmed_reads/{sample}_R1_paired.fastq.gz",
+        r1_unpaired="trimmed_reads/{sample}_R1_unpaired.fastq.gz",
+        r2_paired="trimmed_reads/{sample}_R2_paired.fastq.gz",
+        r2_unpaired="trimmed_reads/{sample}_R2_unpaired.fastq.gz"
+    log:
+        "logs/trimmomatic/{sample}.log"
+    threads: THREADS
+    shell:
+        r"""
+        mkdir -p trimmed_reads logs/trimmomatic
+        trimmomatic PE \
+            -threads {threads} \
+            {input.r1} {input.r2} \
+            {output.r1_paired} {output.r1_unpaired} \
+            {output.r2_paired} {output.r2_unpaired} \
+            LEADING:20 TRAILING:20 SLIDINGWINDOW:4:20 MINLEN:50 \
+            > {log} 2>&1
+        """
+
+rule filter_human_reads:
+    input:
+        r1="trimmed_reads/{sample}_R1_paired.fastq.gz",
+        r2="trimmed_reads/{sample}_R2_paired.fastq.gz"
+    output:
+        r1_unmapped="filtered_reads/{sample}_R1_unmapped.fq.gz",
+        r2_unmapped="filtered_reads/{sample}_R2_unmapped.fq.gz",
+        temp_bam=temp("bowtie_temp/{sample}.bam"),
+        temp_unmapped=temp("bowtie_temp/{sample}.unmapped.bam")
+    threads: THREADS
+    shell:
+        """
+        mkdir -p bowtie_temp filtered_reads
+
+        bowtie2 -x {GENOME_INDEX} -1 {input.r1} -2 {input.r2} \
+            -S /dev/stdout -p {threads} --very-sensitive | \
+        samtools view -@ {threads} -b -o {output.temp_bam} -
+
+        samtools view -@ {threads} -b -f 12 {output.temp_bam} | \
+            samtools sort -n -@ {threads} -o {output.temp_unmapped} -
+
+        bedtools bamtofastq \
+            -i {output.temp_unmapped} \
+            -fq filtered_reads/{wildcards.sample}_R1_unmapped.fq \
+            -fq2 filtered_reads/{wildcards.sample}_R2_unmapped.fq
+
+        gzip -f filtered_reads/{wildcards.sample}_R1_unmapped.fq
+        gzip -f filtered_reads/{wildcards.sample}_R2_unmapped.fq
+        """
+
+
+
+
+
+
+
+
+
+
+
