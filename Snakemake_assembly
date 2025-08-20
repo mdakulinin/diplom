@@ -1,0 +1,174 @@
+import glob
+import re
+import os
+
+# Settings
+READS_DIR = "/home/galanova/students/misha/diplom/preprocessing/filtered_reads"
+SAMPLES = sorted(
+    d.replace("-metagenome", "")
+    for d in os.listdir("/home/galanova/projects/kulakova_deti/metagenome_may2025")
+    if d.endswith("-metagenome")
+)
+GENOME_INDEX = "/home/galanova/human_genome/GRCh38_index"
+GENEMARK_BIN = "/home/galanova/students/misha/MetaGeneMark/gmhmmp"
+GENEMARK_MODEL = "/home/galanova/students/misha/MetaGeneMark/MetaGeneMark_v1.mod"
+AA_FASTA_DIR = "aa_fasta_results"
+BLAST_OUTDIR = "blastp_all_results"
+BLAST_DBS = {
+    "CARD": "/home/galanova/students/misha/kulakova_2025/MetaGeneMark/CARD_databases/prot/CARD_protein_db",
+    "CATALOG": "/home/galanova/students/misha/kulakova_2025/MetaGeneMark/catalog.09.05.2021/catalog.09.05.2021",
+    "OTHER": "/home/galanova/students/misha/kulakova_2025/MetaGeneMark/modified_VFDB_setB_full_pro/modified_VFDB_setB_full_pro"
+}
+BLAST_INPUT_DIR = "blastp_all_results"
+BLAST_OUTPUT_DIR = "filtered_blast_results"
+THREADS = 32
+
+
+rule all:
+    input:
+        expand("assemblies/{sample}/idba_ud/contig.fa", sample=SAMPLES),
+        expand("assemblies/{sample}/metaspades/contigs.fasta", sample=SAMPLES),
+        expand("quast/idba_ud/{sample}", sample=SAMPLES),
+        expand("quast/metaspades/{sample}", sample=SAMPLES)
+
+
+
+rule unpack:
+    input:
+        r1="/home/galanova/students/misha/diplom/preprocessing/filtered_reads/{sample}_R1_unmapped.fq.gz",
+        r2="/home/galanova/students/misha/diplom/preprocessing/filtered_reads/{sample}_R2_unmapped.fq.gz"
+    output:
+        r1_unpacked="/home/galanova/students/misha/diplom/preprocessing/filtered_reads/{sample}_R1_unmapped.fq",
+        r2_unpacked="/home/galanova/students/misha/diplom/preprocessing/filtered_reads/{sample}_R2_unmapped.fq"
+    shell:
+        r"""
+        gunzip -c {input.r1} > {output.r1_unpacked}
+        gunzip -c {input.r2} > {output.r2_unpacked}
+        """
+
+# -------- IDBA-UD --------
+# Подготовка: пары fq -> один fasta (idba_ud требует fasta и слитые пары)
+rule idbaud_prepare_fasta:
+    input:
+        r1="/home/galanova/students/misha/diplom/preprocessing/filtered_reads/{sample}_R1_unmapped.fq",
+        r2="/home/galanova/students/misha/diplom/preprocessing/filtered_reads/{sample}_R2_unmapped.fq"
+    output:
+        merged="assemblies/{sample}/idba_ud/reads.fa"
+    shell:
+        r"""
+        outdir=assemblies/{wildcards.sample}/idba_ud
+        mkdir -p "$outdir"
+        # fq2fa идёт в комплекте с IDBA; --filter убирает низкокач.
+        # большинство сборок понимают .gz напрямую; если нет — разожми заранее.
+        fq2fa --merge --filter {input.r1} {input.r2} {output.merged}
+        """
+
+
+
+rule idbaud_assembly:
+    input:
+        merged="assemblies/{sample}/idba_ud/reads.fa"
+    output:
+        contigs="assemblies/{sample}/idba_ud/contig.fa",
+        scaffolds="assemblies/{sample}/idba_ud/scaffold.fa"
+    threads: 32
+    shell:
+        r"""
+        outdir=assemblies/{wildcards.sample}/idba_ud
+        idba_ud \
+          -r {input.merged} \
+          -o "$outdir" \
+          --pre_correction \
+          --num_threads {threads} && \
+        # Удаляем пробелы в названиях контигов
+        sed -i '/^>/ s/ /_/g' assemblies/{wildcards.sample}/idba_ud/contig.fa && \
+        # Удаляем промежуточный reads.fa после успешной сборки
+        rm -f {input.merged}
+        """
+
+# -------- SPADES --------
+
+rule metaspades_assembly:
+    input:
+        r1="/home/galanova/students/misha/diplom/preprocessing/filtered_reads/{sample}_R1_unmapped.fq",
+        r2="/home/galanova/students/misha/diplom/preprocessing/filtered_reads/{sample}_R2_unmapped.fq"
+    output:
+        contigs="assemblies/{sample}/metaspades/contigs.fasta",
+        scaffolds="assemblies/{sample}/metaspades/scaffolds.fasta"
+    threads: 32
+    log:
+        "logs/metaspades/{sample}.log"
+    shell:
+        r"""
+        outdir=assemblies/{wildcards.sample}/metaspades
+        mkdir -p "$outdir"
+        spades.py \
+          --meta --only-assembler \
+          -1 {input.r1} \
+          -2 {input.r2} \
+          -o "$outdir" \
+          -t {threads} &> {log}
+        """
+
+# ===== QUAST / MetaQUAST =====
+
+# IDBA-UD: оцениваем assemblies/{sample}/idba_ud/contig.fa
+rule quast_idbaud:
+    input:
+        contigs="assemblies/{sample}/idba_ud/contig.fa"
+    output:
+        outdir=directory("quast/idba_ud/{sample}")
+    threads: 32
+    log:
+        "logs/quast/idba_ud/{sample}.log"
+    shell:
+        r"""
+        mkdir -p quast/idba_ud/{wildcards.sample} logs/quast/idba_ud
+        quast.py \
+          --threads {threads} \
+          -o quast/idba_ud/{wildcards.sample} \
+          {input.contigs} &> {log}
+        """
+
+# metaSPAdes: оцениваем assemblies/{sample}/metaspades/contigs.fasta
+rule quast_metaspades:
+    input:
+        contigs="assemblies/{sample}/metaspades/contigs.fasta"
+    output:
+        outdir=directory("quast/metaspades/{sample}")
+    threads: 32
+    log:
+        "logs/quast/metaspades/{sample}.log"
+    shell:
+        r"""
+        mkdir -p quast/metaspades/{wildcards.sample} logs/quast/metaspades
+        quast.py \
+          --threads {threads} \
+          -o quast/metaspades/{wildcards.sample} \
+          {input.contigs} &> {log}
+        """
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
